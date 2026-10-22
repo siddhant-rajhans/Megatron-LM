@@ -17,6 +17,9 @@ from megatron.core.tensor_parallel.random import (
     prime_cuda_rng_states_for_graph_capture,
 )
 from megatron.core.transformer.cuda_graphs import capture_constants
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    prepare_virtual_expert_tables_for_cuda_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +327,7 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
             symmetric_wgrad_pool.reset_completed_reuse_events()
+            prepare_virtual_expert_tables_for_cuda_graph(model)
             rerun_state_machine = get_rerun_state_machine()
             with (
                 capture_constants(FullCudaGraphWrapper.cuda_graph[training_str]),
@@ -344,7 +348,16 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            # MoonEP/TE lazily retain autograd state during warmup. Create it on
+            # the capture stream, just as training does for DDP's AccumulateGrad nodes.
+            caller = torch.cuda.current_stream()
+            warmup_stream = get_shared_capture_stream()
+            warmup_stream.wait_stream(caller)
+            with torch.cuda.stream(warmup_stream):
+                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                    *args, **kwargs
+                )
+            caller.wait_stream(warmup_stream)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
