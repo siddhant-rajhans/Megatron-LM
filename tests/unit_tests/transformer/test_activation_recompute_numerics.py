@@ -398,12 +398,6 @@ class TestActivationRecomputeNumerics:
         except Exception:
             local_passed = False
             local_error = traceback.format_exc()
-            # A peer may still be in model collectives; report before the flag all-reduce.
-            print(
-                f"Rank {Utils.rank} recompute parity failure:\n{local_error}",
-                file=sys.stderr,
-                flush=True,
-            )
 
         self.assert_all_ranks_passed(local_passed, local_error)
 
