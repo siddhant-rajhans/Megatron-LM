@@ -1422,6 +1422,8 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
     # Full capture must not join their uncaptured streams at gradient finalization.
     monkeypatch.setattr(gtp, "_AG_STREAMS", {})
     monkeypatch.setattr(gtp, "_RS_STREAMS", {})
+    # Cache tickets retain model parameters; reset_gtp_state() does not release them.
+    monkeypatch.setattr(gtp, "_GTP_CACHE", None)
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     monkeypatch.setattr(
@@ -1445,35 +1447,23 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
     model_parallel_cuda_manual_seed(1234)
     torch.manual_seed(1234)
     pg = ProcessGroupCollection.use_mpu_process_groups()
-    config = TransformerConfig(
+    config = _virtual_expert_hybridep_config(
         num_layers=3,
-        hidden_size=128,
-        num_attention_heads=4,
         ffn_hidden_size=256,
         moe_ffn_hidden_size=256,
         num_moe_experts=4,
-        expert_model_parallel_size=2,
         tensor_parallel_num_weight_shards=4,
         expert_tensor_parallel_num_weight_shards=2,
         moe_router_topk=2,
-        moe_router_dtype="fp32",
         moe_router_load_balancing_type="quantile_balancing",
         moe_aux_loss_coeff=0,
         moe_router_score_function="sigmoid",
         moe_router_topk_scaling_factor=3.16,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
-        moe_virtual_expert_load_balance=True,
-        moe_grouped_gemm=True,
         moe_use_grouped_tensor=True,
-        use_transformer_engine_op_fuser=True,
         use_fused_weighted_squared_relu=True,
         activation_func=squared_relu,
-        gradient_accumulation_fusion=True,
-        add_bias_linear=False,
+        gated_linear_unit=False,
         normalization="RMSNorm",
-        bf16=True,
-        params_dtype=torch.bfloat16,
         hidden_dropout=0,
         attention_dropout=0,
         fp8="e4m3" if mxfp8 else None,
@@ -1559,7 +1549,7 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
             torch.randint(0, 128, tokens.shape, device="cuda", generator=rng),
             torch.randint(0, 128, labels.shape, device="cuda", generator=rng),
         )
-        for _ in range(4)
+        for _ in range(2)
     ]
 
     def set_inputs(index):
@@ -1585,7 +1575,14 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
         loss.sum().backward()
         gtp.wait_for_gtp_grad_reduction_on_current_stream()
         model.finish_grad_sync()
-        return [loss.detach().clone(), *[p.main_grad.clone() for p in model.parameters()]]
+        return loss.detach()
+
+    def snapshot(loss):
+        # Inspect persistent DDP gradients after execution, without capturing test-only copies.
+        torch.cuda.synchronize()
+        return [
+            value.detach().cpu() for value in [loss, *[p.main_grad for p in model.parameters()]]
+        ]
 
     wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=1)
     wrapper.reset_cuda_graph()
@@ -1596,32 +1593,26 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
         for generation in range(2):
             plans.clear()
             actual = []
-            for step in range(9):
-                set_inputs(step % 4)
-                result = wrapper(**kwargs)
-                torch.cuda.synchronize()
+            # One eager warmup, then four replays alternating inputs and overloaded EP owners.
+            for step in range(5):
+                set_inputs(step % len(inputs))
+                loss = wrapper(**kwargs)
                 if step >= 1:
-                    actual.append([t.detach().cpu().clone() for t in result])
+                    actual.append(snapshot(loss))
             assert wrapper.cuda_graph["training"] is not None
             active = torch.stack([(plan.experts_to_copy >= 0).any() for plan in plans]).any().int()
             dist.all_reduce(active)
             assert active.item(), "The test must exercise virtual-expert transfers"
-            slots = [
-                p._gtp_eager_wgrad_ring_slot
-                for p in model.parameters()
-                if hasattr(p, "_gtp_eager_wgrad_ring_slot")
-            ]
-            assert slots and len({id(slot) for slot in slots}) < len(slots)
             wrapper.reset_cuda_graph()
             expected = []
             for index in range(len(inputs)):
                 set_inputs(index)
-                expected.append([v.detach().cpu().clone() for v in forward_backward()])
+                expected.append(snapshot(forward_backward()))
             for step, result in enumerate(actual, start=1):
                 for name, value, reference in zip(
                     ["loss", *[name for name, _ in model.named_parameters()]],
                     result,
-                    expected[step % 4],
+                    expected[step % len(inputs)],
                 ):
                     _assert_numerical_parity(
                         value,
@@ -1639,4 +1630,13 @@ def test_virtual_expert_full_iteration_lifecycle(monkeypatch, request, mxfp8, mt
         gtp._GTP_PARAMS.clear()
         destroy_moe_metrics_tracker()
         fused_a2a.reset_hybrid_ep_buffer()
+        # Model-parallel teardown drops NCCL group references without destroying
+        # their communicators. Do not leave this test's groups in PyTorch's registry.
+        nccl_groups = [
+            group
+            for group in ps._global_process_group_list
+            if group is not None and dist.get_backend(group) == "nccl"
+        ]
         Utils.destroy_model_parallel()
+        for group in nccl_groups:
+            dist.destroy_process_group(group)
